@@ -53,19 +53,21 @@ class TranslationDataset(Dataset):
 
 class BPETranslationDataset(Dataset):
     def __init__(self, en_sentences, de_sentences, en_sp, de_sp):
-        self.en_sentences = en_sentences
-        self.de_sentences = de_sentences
-        self.en_sp = en_sp
-        self.de_sp = de_sp
+        print("Pre-encoding BPE tokens...")
+        self.en_tokens = [
+            [en_sp.bos_id()] + en_sp.encode(s) + [en_sp.eos_id()]
+            for s in en_sentences
+        ]
+        self.de_tokens = [
+            [de_sp.bos_id()] + de_sp.encode(s) + [de_sp.eos_id()]
+            for s in de_sentences
+        ]
 
     def __len__(self):
-        return len(self.en_sentences)
+        return len(self.en_tokens)
 
     def __getitem__(self, idx):
-        # bos_id=1 maps to <s> (start), eos_id=2 maps to </s> (end)
-        en_tokens = [self.en_sp.bos_id()] + self.en_sp.encode(self.en_sentences[idx]) + [self.en_sp.eos_id()]
-        de_tokens = [self.de_sp.bos_id()] + self.de_sp.encode(self.de_sentences[idx]) + [self.de_sp.eos_id()]
-        return en_tokens, de_tokens
+        return self.en_tokens[idx], self.de_tokens[idx]
 
 
 def train_sentencepiece(sentences, model_prefix, vocab_size=32000):
@@ -95,8 +97,11 @@ def train_sentencepiece(sentences, model_prefix, vocab_size=32000):
     sp.load(model_path)
     return sp
     
-def collate_fn(batch):
+def collate_fn(batch, max_len=128):
       en_batch, de_batch = zip(*batch)
+      # Truncate to max_len tokens
+      en_batch = [seq[:max_len] for seq in en_batch]
+      de_batch = [seq[:max_len] for seq in de_batch]
       en_padded = pad_sequence(en_batch)
       de_padded = pad_sequence(de_batch)
       return torch.tensor(en_padded), torch.tensor(de_padded)
@@ -106,11 +111,11 @@ def collate_fn(batch):
 
 def load_wmt14(split="train", cache_dir="/home/jfan5/transformer/data"):
     """Load WMT14 de-en dataset; downloads from HuggingFace if not cached locally"""
-    csv_path = os.path.join(cache_dir, f"wmt14_de-en_{split}.csv")
+    parquet_path = os.path.join(cache_dir, f"wmt14_de-en_{split}.parquet")
 
-    if os.path.exists(csv_path):
-        print(f"Loading cached {split} data from {csv_path}")
-        df = pd.read_csv(csv_path)
+    if os.path.exists(parquet_path):
+        print(f"Loading cached {split} data from {parquet_path}")
+        df = pd.read_parquet(parquet_path)
     else:
         print(f"Downloading WMT14 de-en {split} split...")
         from datasets import load_dataset
@@ -119,13 +124,13 @@ def load_wmt14(split="train", cache_dir="/home/jfan5/transformer/data"):
         de_sentences = [item["translation"]["de"] for item in ds]
         df = pd.DataFrame({"en": en_sentences, "de": de_sentences})
         os.makedirs(cache_dir, exist_ok=True)
-        df.to_csv(csv_path, index=False)
-        print(f"Saved to {csv_path}")
+        df.to_parquet(parquet_path, index=False)
+        print(f"Saved to {parquet_path}")
 
     return df
 
 
-def load_data(split="train", batch_size=32, tokenizer="bpe", vocab_size=32000):
+def load_data(split="train", batch_size=32, tokenizer="bpe", vocab_size=32000, max_len=128):
     """
     Load dataset.
     tokenizer: "word" for word-level tokenization, "bpe" for SentencePiece BPE tokenization
@@ -138,7 +143,7 @@ def load_data(split="train", batch_size=32, tokenizer="bpe", vocab_size=32000):
         en_vocab = build_vocab(en_sentences)
         de_vocab = build_vocab(de_sentences)
         dataset = TranslationDataset(en_sentences, de_sentences, en_vocab, de_vocab)
-        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=True)
+        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=lambda batch: collate_fn(batch, max_len=max_len), shuffle=True)
         return dataloader, len(en_vocab), len(de_vocab)
     else:
         sp_dir = "/home/jfan5/transformer/data/spm"
@@ -146,5 +151,14 @@ def load_data(split="train", batch_size=32, tokenizer="bpe", vocab_size=32000):
         en_sp = train_sentencepiece(en_sentences, f"{sp_dir}/en_bpe", vocab_size=vocab_size)
         de_sp = train_sentencepiece(de_sentences, f"{sp_dir}/de_bpe", vocab_size=vocab_size)
         dataset = BPETranslationDataset(en_sentences, de_sentences, en_sp, de_sp)
-        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=True)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            collate_fn=lambda batch: collate_fn(batch, max_len=max_len),
+            shuffle=True,
+            num_workers=8,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True,
+        )
         return dataloader, en_sp.get_piece_size(), de_sp.get_piece_size()

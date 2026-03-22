@@ -28,36 +28,31 @@ class TransformerLRScheduler:
 def train(model, dataloader, optimizer, criterion, device, scheduler=None):
     model.train()
     total_loss = 0
+    scaler = torch.amp.GradScaler('cuda')
+
     for batch in dataloader:
-        #
         input_seq, target_seq = batch
         input_seq, target_seq = input_seq.to(device), target_seq.to(device)
 
         optimizer.zero_grad()
 
-        # Shifted targets: feed ground truth as input for teacher forcing / parallel training
-        # To predict token i, the model uses all tokens before position i
-        tgt_input = target_seq[:, :-1]   # [<start>, tok1, tok2, tok3]
-        tgt_output = target_seq[:, 1:]   # [tok1, tok2, tok3, <end>]
+        tgt_input = target_seq[:, :-1]
+        tgt_output = target_seq[:, 1:]
 
-        # Create masks (must be before model forward pass)
         src_mask = create_padding_mask(input_seq)
-        # tgt_mask combines padding mask and causal mask, shape: (batch, 1, seq_len, seq_len)
         tgt_mask = create_padding_mask(tgt_input) & create_causal_mask(tgt_input)
 
-        # Forward pass
+        with torch.amp.autocast('cuda'):
+            output = model(input_seq, tgt_input, src_mask, tgt_mask)
+            loss = criterion(output.reshape(-1, output.size(-1)), tgt_output.reshape(-1))
 
-        output = model(input_seq, tgt_input, src_mask, tgt_mask)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
-        # Compute loss
-        loss = criterion(output.reshape(-1, output.size(-1)), tgt_output.reshape(-1))
         total_loss += loss.item()
-
-        # Backpropagation and optimization
-        loss.backward()
-        optimizer.step()
-
-        # Update learning rate after each batch
         if scheduler is not None:
             scheduler.step()
 
@@ -66,19 +61,21 @@ def train(model, dataloader, optimizer, criterion, device, scheduler=None):
 
 if __name__ == "__main__":
     config = {
-        "d_model": 768,
-        "num_heads": 8,
-        "d_ff": 2048,
+        "d_model": 1024,
+        "num_heads": 16,
+        "d_ff": 4096,
         "num_layers": 6,
         "lr": 0.001,
         "epochs": 30,
         "patience": 5,
+        "batch_size": 256,
+        "max_len": 256,
     }
 
     wandb.init(project="transformer", config=config)
 
     print("Loading data...")
-    dataloader, en_vocab_size, de_vocab_size=load_data()
+    dataloader, en_vocab_size, de_vocab_size = load_data(batch_size=config["batch_size"], max_len=config["max_len"])
     model=Transformer(d_model=config["d_model"], num_heads=config["num_heads"], d_ff=config["d_ff"], num_layers=config["num_layers"], src_vocab_size=en_vocab_size, tgt_vocab_size=de_vocab_size)
     optimizer = torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9)
     scheduler = TransformerLRScheduler(optimizer, config["d_model"], warmup_steps=4000)
