@@ -1,5 +1,6 @@
 import os
 import tempfile
+import pickle
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 import torch
@@ -52,16 +53,30 @@ class TranslationDataset(Dataset):
 
 
 class BPETranslationDataset(Dataset):
-    def __init__(self, en_sentences, de_sentences, en_sp, de_sp):
-        print("Pre-encoding BPE tokens...")
-        self.en_tokens = [
-            [en_sp.bos_id()] + en_sp.encode(s) + [en_sp.eos_id()]
-            for s in en_sentences
-        ]
-        self.de_tokens = [
-            [de_sp.bos_id()] + de_sp.encode(s) + [de_sp.eos_id()]
-            for s in de_sentences
-        ]
+    def __init__(self, en_sentences, de_sentences, en_sp, de_sp, cache_dir=None):
+        cache_path = os.path.join(cache_dir, "bpe_tokens.pkl") if cache_dir else None
+
+        if cache_path and os.path.exists(cache_path):
+            print(f"Loading cached BPE tokens from {cache_path}")
+            with open(cache_path, "rb") as f:
+                cached = pickle.load(f)
+            self.en_tokens = cached["en_tokens"]
+            self.de_tokens = cached["de_tokens"]
+        else:
+            print("Pre-encoding BPE tokens...")
+            self.en_tokens = [
+                [en_sp.bos_id()] + en_sp.encode(s) + [en_sp.eos_id()]
+                for s in en_sentences
+            ]
+            self.de_tokens = [
+                [de_sp.bos_id()] + de_sp.encode(s) + [de_sp.eos_id()]
+                for s in de_sentences
+            ]
+            if cache_path:
+                os.makedirs(cache_dir, exist_ok=True)
+                with open(cache_path, "wb") as f:
+                    pickle.dump({"en_tokens": self.en_tokens, "de_tokens": self.de_tokens}, f)
+                print(f"Cached BPE tokens to {cache_path}")
 
     def __len__(self):
         return len(self.en_tokens)
@@ -109,7 +124,7 @@ def collate_fn(batch, max_len=128):
 
 
 
-def load_wmt14(split="train", cache_dir="/home/jfan5/transformer/data"):
+def load_wmt14(split="train", cache_dir=os.path.expanduser("~/transformer/data")):
     """Load WMT14 de-en dataset; downloads from HuggingFace if not cached locally"""
     parquet_path = os.path.join(cache_dir, f"wmt14_de-en_{split}.parquet")
 
@@ -130,12 +145,16 @@ def load_wmt14(split="train", cache_dir="/home/jfan5/transformer/data"):
     return df
 
 
-def load_data(split="train", batch_size=32, tokenizer="bpe", vocab_size=32000, max_len=128):
+def load_data(split="train", batch_size=32, tokenizer="bpe", vocab_size=32000, max_len=128, max_samples=None):
     """
     Load dataset.
     tokenizer: "word" for word-level tokenization, "bpe" for SentencePiece BPE tokenization
+    max_samples: if set, randomly sample this many sentence pairs
     """
     df = load_wmt14(split=split)
+    if max_samples and len(df) > max_samples:
+        df = df.sample(n=max_samples, random_state=42).reset_index(drop=True)
+        print(f"Sampled {max_samples} sentence pairs from {split} set")
     en_sentences = df["en"].tolist()
     de_sentences = df["de"].tolist()
 
@@ -146,11 +165,12 @@ def load_data(split="train", batch_size=32, tokenizer="bpe", vocab_size=32000, m
         dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=lambda batch: collate_fn(batch, max_len=max_len), shuffle=True)
         return dataloader, len(en_vocab), len(de_vocab)
     else:
-        sp_dir = "/home/jfan5/transformer/data/spm"
+        sp_dir = os.path.expanduser("~/transformer/data/spm")
         os.makedirs(sp_dir, exist_ok=True)
         en_sp = train_sentencepiece(en_sentences, f"{sp_dir}/en_bpe", vocab_size=vocab_size)
         de_sp = train_sentencepiece(de_sentences, f"{sp_dir}/de_bpe", vocab_size=vocab_size)
-        dataset = BPETranslationDataset(en_sentences, de_sentences, en_sp, de_sp)
+        cache_dir = os.path.expanduser("~/transformer/data/spm")
+        dataset = BPETranslationDataset(en_sentences, de_sentences, en_sp, de_sp, cache_dir=cache_dir)
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
